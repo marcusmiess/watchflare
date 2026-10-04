@@ -36,4 +36,5 @@ COPY --from=data-init /var/lib/watchflare /var/lib/watchflare
 USER 65532
 VOLUME ["/var/lib/watchflare"]
 EXPOSE 8080 50051
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 CMD ["/watchflare-hub", "healthcheck"]
 ENTRYPOINT ["/watchflare-hub"]

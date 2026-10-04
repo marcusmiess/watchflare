@@ -32,6 +32,11 @@ import (
 const httpPort = "8080"
 
 func main() {
+	// `watchflare-hub healthcheck` probes a running Hub (used by the Docker HEALTHCHECK)
+	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
+		os.Exit(runHealthcheck(healthcheckURL))
+	}
+
 	// Initialize logger first so all subsequent output uses the clean format
 	logger.Init()
 
