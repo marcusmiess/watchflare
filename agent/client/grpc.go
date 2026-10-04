@@ -502,6 +502,9 @@ func (c *Client) SendContainerImageUpdates(agentID, agentKey string, updates []m
 			Status:        u.Status,
 			Error:         u.Error,
 			CheckedAt:     u.CheckedAt.Unix(),
+			LocalVersion:  u.LocalVersion,
+			RemoteVersion: u.RemoteVersion,
+			CommitsBehind: int32(u.CommitsBehind),
 		})
 	}
 

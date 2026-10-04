@@ -29,8 +29,12 @@ const (
 	defaultImageCheckMaxAge = 6 * time.Hour
 	// imageCheckErrorMaxAge is shorter so transient registry failures recover sooner.
 	imageCheckErrorMaxAge = 1 * time.Hour
-	dockerHubRegistry     = "docker.io"
-	dockerHubAPIHost      = "registry-1.docker.io"
+	// defaultMetaFetchesPerCheck caps registry manifest GETs per check. Unlike HEAD
+	// requests they count against Docker Hub's anonymous pull limit, so version
+	// lookups for many new images are spread over several checks.
+	defaultMetaFetchesPerCheck = 3
+	dockerHubRegistry          = "docker.io"
+	dockerHubAPIHost           = "registry-1.docker.io"
 )
 
 // errNotPublic means the registry doesn't serve the image anonymously. Docker Hub
@@ -48,6 +52,8 @@ var manifestAcceptTypes = strings.Join([]string{
 }, ", ")
 
 // ImageUpdate is the registry update state of the image a running container uses.
+// Versions come from version tags, image labels or, for rolling builds, the latest
+// GitHub release plus commits ("2025-08-05+277"); empty if unknown.
 type ImageUpdate struct {
 	ContainerID   string
 	ContainerName string
@@ -57,6 +63,9 @@ type ImageUpdate struct {
 	Status        string
 	Error         string
 	CheckedAt     time.Time
+	LocalVersion  string
+	RemoteVersion string
+	CommitsBehind int // commits between running and registry image (rolling builds only)
 }
 
 // imageResult is the cached outcome of a registry lookup for one (image ref, image ID) pair.
@@ -66,6 +75,22 @@ type imageResult struct {
 	Status       string
 	Error        string
 	CheckedAt    time.Time
+	Local        imageMeta
+	Platform     imagePlatform // platform of the local image, used to pick the remote manifest
+	Ref          imageReference
+}
+
+// imageMeta is the version information an image carries in its labels.
+type imageMeta struct {
+	Version  string // version label ("latest" ignored)
+	Revision string // VCS revision label
+	Source   string // source repository URL label
+}
+
+type imagePlatform struct {
+	OS           string `json:"os"`
+	Architecture string `json:"architecture"`
+	Variant      string `json:"variant"`
 }
 
 // imageReference is a parsed image reference such as "ghcr.io/org/app:1.2".
@@ -87,6 +112,17 @@ type ImageUpdateChecker struct {
 	registryBaseURL func(registry string) string
 	now             func() time.Time
 	cache           map[string]imageResult
+	// remoteMeta caches registry image metadata by "registry/repo@digest"; a digest's
+	// metadata never changes, so entries live as long as a container needs them.
+	remoteMeta          map[string]imageMeta
+	metaFetchesPerCheck int
+	metaBudget          int
+
+	dockerHubBaseURL string
+	githubBaseURL    string
+	tagCache         map[string]tagInfo // "registry/repo@digest" → tags pointing at it
+	githubCache      map[string][2]int  // compare results (ahead, behind)
+	githubReleases   map[string]string  // latest release per repo, reset every check
 }
 
 // NewImageUpdateChecker returns a checker with the default 6h re-check interval.
@@ -97,6 +133,14 @@ func NewImageUpdateChecker() *ImageUpdateChecker {
 		registryBaseURL: defaultRegistryBaseURL,
 		now:             time.Now,
 		cache:           make(map[string]imageResult),
+
+		remoteMeta:          make(map[string]imageMeta),
+		metaFetchesPerCheck: defaultMetaFetchesPerCheck,
+
+		dockerHubBaseURL: dockerHubAPIBaseURL,
+		githubBaseURL:    githubAPIBaseURL,
+		tagCache:         make(map[string]tagInfo),
+		githubCache:      make(map[string][2]int),
 	}
 }
 
@@ -114,6 +158,8 @@ func (c *ImageUpdateChecker) Check(ctx context.Context) ([]ImageUpdate, error) {
 	var lastErr error
 	collected := make(map[string]bool)
 	seen := make(map[string]bool)
+	c.metaBudget = c.metaFetchesPerCheck
+	c.githubReleases = make(map[string]string)
 
 	for _, sock := range knownContainerSockets() {
 		if collected[sock.runtime] {
@@ -137,6 +183,16 @@ func (c *ImageUpdateChecker) Check(ctx context.Context) ([]ImageUpdate, error) {
 	for key := range c.cache {
 		if !seen[key] {
 			delete(c.cache, key)
+		}
+	}
+	for key := range c.remoteMeta {
+		if !seen[key] {
+			delete(c.remoteMeta, key)
+		}
+	}
+	for key := range c.tagCache {
+		if !seen[key] {
+			delete(c.tagCache, key)
 		}
 	}
 
@@ -180,6 +236,11 @@ func (c *ImageUpdateChecker) checkSocket(ctx context.Context, daemon *http.Clien
 			name = strings.TrimPrefix(ct.Names[0], "/")
 		}
 
+		versions := versionInfo{Local: res.Local.Version}
+		if res.LocalDigest != "" && (res.Status == ImageStatusUpToDate || res.Status == ImageStatusUpdateAvailable) {
+			versions = c.resolveVersions(ctx, res, seen)
+		}
+
 		updates = append(updates, ImageUpdate{
 			ContainerID:   truncateID(ct.ID),
 			ContainerName: name,
@@ -189,9 +250,32 @@ func (c *ImageUpdateChecker) checkSocket(ctx context.Context, daemon *http.Clien
 			Status:        res.Status,
 			Error:         res.Error,
 			CheckedAt:     res.CheckedAt,
+			LocalVersion:  versions.Local,
+			RemoteVersion: versions.Remote,
+			CommitsBehind: versions.CommitsBehind,
 		})
 	}
 	return updates, nil
+}
+
+// remoteImageMeta returns the cached label metadata of a registry image, fetching
+// it while this check's budget lasts. Failures are not cached, so the
+// lookup is retried on the next check.
+func (c *ImageUpdateChecker) remoteImageMeta(ctx context.Context, key string, res imageResult) imageMeta {
+	if meta, ok := c.remoteMeta[key]; ok {
+		return meta
+	}
+	if c.metaBudget <= 0 {
+		return imageMeta{}
+	}
+	c.metaBudget--
+	meta, err := c.fetchRemoteMeta(ctx, res.Ref, res.RemoteDigest, res.Platform)
+	if err != nil {
+		slog.Debug("registry metadata lookup failed", "image", key, "error", err)
+		return imageMeta{}
+	}
+	c.remoteMeta[key] = meta
+	return meta
 }
 
 func (c *ImageUpdateChecker) expired(res imageResult) bool {
@@ -212,12 +296,15 @@ func (c *ImageUpdateChecker) resolve(ctx context.Context, daemon *http.Client, r
 		res.Status, res.Error = ImageStatusError, err.Error()
 		return res
 	}
+	res.Ref = parsed
 
 	image, err := inspectDaemonImage(ctx, daemon, imageID)
 	if err != nil {
 		res.Status, res.Error = ImageStatusError, fmt.Sprintf("inspect image: %v", err)
 		return res
 	}
+	res.Local = metaFromLabels(image.Config.Labels)
+	res.Platform = imagePlatform{OS: image.Os, Architecture: image.Architecture, Variant: image.Variant}
 
 	if parsed.Digest != "" {
 		res.Status, res.LocalDigest = ImageStatusPinned, parsed.Digest
@@ -360,6 +447,82 @@ func (c *ImageUpdateChecker) digestFromBody(ctx context.Context, manifestURL str
 	return "sha256:" + hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// registryManifest covers both image indexes (manifests) and image manifests (config).
+type registryManifest struct {
+	Manifests []struct {
+		Digest   string        `json:"digest"`
+		Platform imagePlatform `json:"platform"`
+	} `json:"manifests"`
+	Config struct {
+		Digest string `json:"digest"`
+	} `json:"config"`
+}
+
+// fetchRemoteMeta reads the labels of the registry image with the given digest:
+// index → manifest for the local platform → config blob.
+func (c *ImageUpdateChecker) fetchRemoteMeta(ctx context.Context, ref imageReference, digest string, platform imagePlatform) (imageMeta, error) {
+	base := c.registryBaseURL(ref.Registry) + "/v2/" + ref.Repo
+	token := ""
+
+	var manifest registryManifest
+	if err := c.registryGetJSON(ctx, base+"/manifests/"+digest, manifestAcceptTypes, ref, &token, &manifest); err != nil {
+		return imageMeta{}, err
+	}
+	if len(manifest.Manifests) > 0 {
+		platformDigest := selectPlatformManifest(manifest, platform)
+		if platformDigest == "" {
+			return imageMeta{}, fmt.Errorf("no manifest for platform %s/%s", platform.OS, platform.Architecture)
+		}
+		manifest = registryManifest{}
+		if err := c.registryGetJSON(ctx, base+"/manifests/"+platformDigest, manifestAcceptTypes, ref, &token, &manifest); err != nil {
+			return imageMeta{}, err
+		}
+	}
+	if manifest.Config.Digest == "" {
+		return imageMeta{}, errors.New("manifest has no config")
+	}
+
+	var config struct {
+		Config struct {
+			Labels map[string]string `json:"Labels"`
+		} `json:"config"`
+	}
+	if err := c.registryGetJSON(ctx, base+"/blobs/"+manifest.Config.Digest, "*/*", ref, &token, &config); err != nil {
+		return imageMeta{}, err
+	}
+	return metaFromLabels(config.Config.Labels), nil
+}
+
+// selectPlatformManifest picks the index entry matching the local image's platform.
+// Attestation entries ("unknown/unknown") never match.
+func selectPlatformManifest(index registryManifest, platform imagePlatform) string {
+	var fallback string
+	for _, m := range index.Manifests {
+		if m.Platform.OS != platform.OS || m.Platform.Architecture != platform.Architecture {
+			continue
+		}
+		if platform.Variant == "" || m.Platform.Variant == platform.Variant {
+			return m.Digest
+		}
+		if fallback == "" {
+			fallback = m.Digest
+		}
+	}
+	return fallback
+}
+
+func (c *ImageUpdateChecker) registryGetJSON(ctx context.Context, u, accept string, ref imageReference, token *string, out any) error {
+	resp, err := c.registryRequest(ctx, http.MethodGet, u, accept, ref, token)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("registry returned status %d", resp.StatusCode)
+	}
+	return json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(out)
+}
+
 // registryRequest sends a registry request, answering a Bearer challenge once with an
 // anonymous token. The token is stored in *token for follow-up requests.
 func (c *ImageUpdateChecker) registryRequest(ctx context.Context, method, u, accept string, ref imageReference, token *string) (*http.Response, error) {
@@ -497,13 +660,37 @@ func listDaemonContainers(ctx context.Context, daemon *http.Client) ([]daemonCon
 
 // daemonImage is the subset of /images/{id}/json used by the image checker.
 type daemonImage struct {
-	RepoDigests []string `json:"RepoDigests"`
+	RepoDigests  []string `json:"RepoDigests"`
+	Os           string   `json:"Os"`
+	Architecture string   `json:"Architecture"`
+	Variant      string   `json:"Variant"`
+	Config       struct {
+		Labels map[string]string `json:"Labels"`
+	} `json:"Config"`
 }
 
 func inspectDaemonImage(ctx context.Context, daemon *http.Client, imageID string) (daemonImage, error) {
 	var image daemonImage
 	err := daemonGetJSON(ctx, daemon, "/images/"+url.PathEscape(imageID)+"/json", &image)
 	return image, err
+}
+
+// versionLabels are checked in order for a human-readable image version.
+var versionLabels = []string{"org.opencontainers.image.version", "org.label-schema.version", "version"}
+
+// metaFromLabels extracts version, revision and source from image labels.
+// Moving versions like "latest" are ignored.
+func metaFromLabels(labels map[string]string) imageMeta {
+	var m imageMeta
+	for _, key := range versionLabels {
+		if v := strings.TrimSpace(labels[key]); v != "" && v != "latest" {
+			m.Version = v
+			break
+		}
+	}
+	m.Revision = firstNonEmpty(strings.TrimSpace(labels["org.opencontainers.image.revision"]), strings.TrimSpace(labels["org.label-schema.vcs-ref"]))
+	m.Source = firstNonEmpty(strings.TrimSpace(labels["org.opencontainers.image.source"]), strings.TrimSpace(labels["org.label-schema.vcs-url"]))
+	return m
 }
 
 func containerConfigImage(ctx context.Context, daemon *http.Client, containerID string) (string, error) {

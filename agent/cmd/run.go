@@ -593,7 +593,7 @@ func imageUpdatesFingerprint(updates []metrics.ImageUpdate) string {
 	var b strings.Builder
 	b.WriteString("v1")
 	for _, u := range updates {
-		fmt.Fprintf(&b, "|%s %s %s %s %s %d", u.ContainerID, u.Image, u.Status, u.LocalDigest, u.RemoteDigest, u.CheckedAt.Unix())
+		fmt.Fprintf(&b, "|%s %s %s %s %s %d %s %s %d", u.ContainerID, u.Image, u.Status, u.LocalDigest, u.RemoteDigest, u.CheckedAt.Unix(), u.LocalVersion, u.RemoteVersion, u.CommitsBehind)
 	}
 	return b.String()
 }

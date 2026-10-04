@@ -84,27 +84,61 @@ func TestParseBearerChallenge(t *testing.T) {
 type fakeRegistry struct {
 	server    *httptest.Server
 	digests   map[string]string // "repo:tag" → digest
-	manifests atomic.Int32
+	objects   map[string]string // digest → JSON body of a manifest, index or config blob
+	tags      []string          // served by /tags/list, two per page
+	manifests atomic.Int32      // HEAD manifest requests
+	gets      atomic.Int32      // GET manifest requests (count against Docker Hub limits)
 }
 
 func newFakeRegistry(t *testing.T, digests map[string]string) *fakeRegistry {
 	t.Helper()
-	fr := &fakeRegistry{digests: digests}
+	fr := &fakeRegistry{digests: digests, objects: map[string]string{}}
 	fr.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/token" {
 			json.NewEncoder(w).Encode(map[string]string{"token": "tok-" + r.URL.Query().Get("scope")})
 			return
 		}
-		repoTag := strings.TrimPrefix(r.URL.Path, "/v2/")
-		repo, tag, _ := strings.Cut(repoTag, "/manifests/")
+		path := strings.TrimPrefix(r.URL.Path, "/v2/")
+		repo, ref, isManifest := strings.Cut(path, "/manifests/")
+		isTagList := !isManifest && strings.HasSuffix(path, "/tags/list")
+		switch {
+		case isTagList:
+			repo = strings.TrimSuffix(path, "/tags/list")
+		case !isManifest:
+			repo, ref, _ = strings.Cut(path, "/blobs/")
+		}
 		if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer tok-repository:"+repo+":pull") {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="`+fr.server.URL+`/token",service="fake"`)
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		if r.Method != http.MethodHead {
-			t.Errorf("expected HEAD manifest request, got %s", r.Method)
+		if isTagList {
+			start := 0
+			for i, tag := range fr.tags {
+				if tag == r.URL.Query().Get("last") {
+					start = i + 1
+				}
+			}
+			end := min(start+2, len(fr.tags))
+			if end < len(fr.tags) {
+				w.Header().Set("Link", `</v2/`+repo+`/tags/list?last=`+fr.tags[end-1]+`&n=2>; rel="next"`)
+			}
+			json.NewEncoder(w).Encode(map[string]any{"name": repo, "tags": fr.tags[start:end]})
+			return
 		}
+		if r.Method == http.MethodGet {
+			if isManifest {
+				fr.gets.Add(1)
+			}
+			body, ok := fr.objects[ref]
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.Write([]byte(body))
+			return
+		}
+		tag := ref
 		fr.manifests.Add(1)
 		digest, ok := fr.digests[repo+":"+tag]
 		if !ok {
@@ -118,8 +152,8 @@ func newFakeRegistry(t *testing.T, digests map[string]string) *fakeRegistry {
 }
 
 // newFakeDaemon serves the Docker Engine endpoints used by the image checker.
-// images maps image ID → RepoDigests.
-func newFakeDaemon(t *testing.T, containers []daemonContainer, images map[string][]string) *http.Client {
+// images maps image ID → RepoDigests; meta optionally adds labels/platform.
+func newFakeDaemon(t *testing.T, containers []daemonContainer, images map[string][]string, meta ...map[string]daemonImage) *http.Client {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := strings.TrimPrefix(r.URL.Path, "/"+dockerAPIVersion)
@@ -133,7 +167,14 @@ func newFakeDaemon(t *testing.T, containers []daemonContainer, images map[string
 				w.WriteHeader(http.StatusNotFound)
 				return
 			}
-			json.NewEncoder(w).Encode(daemonImage{RepoDigests: digests})
+			image := daemonImage{Os: "linux", Architecture: "amd64"}
+			if len(meta) > 0 {
+				if m, ok := meta[0][id]; ok {
+					image = m
+				}
+			}
+			image.RepoDigests = digests
+			json.NewEncoder(w).Encode(image)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -158,6 +199,10 @@ func newTestChecker(reg *fakeRegistry, now *time.Time) *ImageUpdateChecker {
 	c.registryClient = reg.server.Client()
 	c.registryBaseURL = func(string) string { return reg.server.URL }
 	c.now = func() time.Time { return *now }
+	// Never reach the real Docker Hub API or GitHub from tests.
+	c.dockerHubBaseURL = reg.server.URL + "/hub"
+	c.githubBaseURL = reg.server.URL + "/github"
+	c.githubReleases = map[string]string{}
 	return c
 }
 
@@ -327,5 +372,110 @@ func TestFetchRemoteDigest_FallsBackToBodyHash(t *testing.T) {
 	// sha256("manifest")
 	if want := "sha256:05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f"; got != want {
 		t.Errorf("digest = %q, want %q", got, want)
+	}
+}
+
+func TestMetaFromLabels(t *testing.T) {
+	m := metaFromLabels(map[string]string{
+		"org.opencontainers.image.version":  "latest",
+		"org.opencontainers.image.revision": "f4aa9e0419d7abc",
+		"org.opencontainers.image.source":   "https://github.com/RSS-Bridge/rss-bridge",
+	})
+	if m.Version != "" || m.Revision != "f4aa9e0419d7abc" || m.Source != "https://github.com/RSS-Bridge/rss-bridge" {
+		t.Errorf("unexpected meta: %+v", m)
+	}
+	if v := metaFromLabels(map[string]string{"org.label-schema.version": "2.0"}).Version; v != "2.0" {
+		t.Errorf("label-schema version = %q", v)
+	}
+	if m := metaFromLabels(nil); m != (imageMeta{}) {
+		t.Errorf("nil labels = %+v", m)
+	}
+}
+
+// addRemoteImage registers a multi-arch image in the fake registry and returns its index digest.
+func (fr *fakeRegistry) addRemoteImage(name, version string) string {
+	config := `{"config":{"Labels":{"org.opencontainers.image.version":"` + version + `"}}}`
+	fr.objects["sha256:cfg-"+name] = config
+	fr.objects["sha256:amd64-"+name] = `{"config":{"digest":"sha256:cfg-` + name + `"}}`
+	fr.objects["sha256:arm64-"+name] = `{"config":{"digest":"sha256:wrong"}}`
+	index := "sha256:index-" + name
+	fr.objects[index] = `{"manifests":[
+		{"digest":"sha256:arm64-` + name + `","platform":{"os":"linux","architecture":"arm64","variant":"v8"}},
+		{"digest":"sha256:att-` + name + `","platform":{"os":"unknown","architecture":"unknown"}},
+		{"digest":"sha256:amd64-` + name + `","platform":{"os":"linux","architecture":"amd64"}}
+	]}`
+	return index
+}
+
+func TestImageUpdateChecker_VersionsFromLabels(t *testing.T) {
+	reg := newFakeRegistry(t, map[string]string{})
+	reg.digests["library/nginx:latest"] = reg.addRemoteImage("nginx", "1.27.3")
+
+	localImage := daemonImage{Os: "linux", Architecture: "amd64"}
+	localImage.Config.Labels = map[string]string{"org.opencontainers.image.version": "1.27.0"}
+	daemon := newFakeDaemon(t,
+		[]daemonContainer{{ID: "aaaaaaaaaaaaaaaa", Names: []string{"/web"}, Image: "nginx:latest", ImageID: "sha256:img1", State: "running"}},
+		map[string][]string{"sha256:img1": {"nginx@sha256:old"}},
+		map[string]daemonImage{"sha256:img1": localImage},
+	)
+
+	now := time.Unix(1_800_000_000, 0)
+	c := newTestChecker(reg, &now)
+	c.metaBudget = c.metaFetchesPerCheck
+	updates, err := c.checkSocket(context.Background(), daemon, map[string]bool{})
+	if err != nil || len(updates) != 1 {
+		t.Fatalf("checkSocket: %v, %d updates", err, len(updates))
+	}
+	u := updates[0]
+	if u.Status != ImageStatusUpdateAvailable {
+		t.Fatalf("status = %q", u.Status)
+	}
+	// No version tags in the (fake) registry: both sides fall back to image labels.
+	if u.LocalVersion != "1.27.0" || u.RemoteVersion != "1.27.3" {
+		t.Errorf("versions = %q → %q, want 1.27.0 → 1.27.3", u.LocalVersion, u.RemoteVersion)
+	}
+}
+
+func TestImageUpdateChecker_MetaBudgetAndCache(t *testing.T) {
+	reg := newFakeRegistry(t, map[string]string{})
+	reg.digests["library/nginx:latest"] = reg.addRemoteImage("nginx", "1.27.3")
+	reg.digests["library/redis:7"] = reg.addRemoteImage("redis", "7.4.1")
+	daemon := newFakeDaemon(t,
+		[]daemonContainer{
+			{ID: "aaaaaaaaaaaaaaaa", Names: []string{"/web"}, Image: "nginx:latest", ImageID: "sha256:img1", State: "running"},
+			{ID: "bbbbbbbbbbbbbbbb", Names: []string{"/cache"}, Image: "redis:7", ImageID: "sha256:img2", State: "running"},
+		},
+		map[string][]string{"sha256:img1": {"nginx@sha256:old"}, "sha256:img2": {"redis@sha256:old"}},
+	)
+
+	now := time.Unix(1_800_000_000, 0)
+	c := newTestChecker(reg, &now)
+	c.metaFetchesPerCheck = 1
+	check := func() map[string]ImageUpdate {
+		t.Helper()
+		c.metaBudget = c.metaFetchesPerCheck
+		updates, err := c.checkSocket(context.Background(), daemon, map[string]bool{})
+		if err != nil {
+			t.Fatalf("checkSocket: %v", err)
+		}
+		out := map[string]ImageUpdate{}
+		for _, u := range updates {
+			out[u.ContainerName] = u
+		}
+		return out
+	}
+
+	first := check()
+	if (first["web"].RemoteVersion == "") == (first["cache"].RemoteVersion == "") {
+		t.Fatalf("budget of 1 should fill exactly one container: %+v", first)
+	}
+	second := check()
+	if second["web"].RemoteVersion != "1.27.3" || second["cache"].RemoteVersion != "7.4.1" {
+		t.Fatalf("second check should fill the rest: %+v", second)
+	}
+	gets := reg.gets.Load()
+	check()
+	if reg.gets.Load() != gets {
+		t.Errorf("cached metadata must not be fetched again (%d → %d GETs)", gets, reg.gets.Load())
 	}
 }
