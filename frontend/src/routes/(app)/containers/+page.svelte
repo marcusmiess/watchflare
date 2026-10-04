@@ -13,7 +13,9 @@
 		containerIsLive,
 		filterContainers,
 		imageUpdateLabel,
-		imageUpdateBadgeClass
+		imageUpdateBadgeClass,
+		imageVersionChange,
+		formatImageVersion
 	} from '$lib/utils';
 	import { formatRate } from '$lib/chart-utils';
 	import { userStore } from '$lib/stores/user';
@@ -500,6 +502,9 @@
 								{truncateImage(c.image)}
 							</p>
 						{/if}
+						{#if c.image_update_status === 'update_available'}
+							<p class="text-xs font-mono text-warning truncate">{imageVersionChange(c)}</p>
+						{/if}
 						<div class="flex items-center gap-2">
 							<span class="w-16 shrink-0 text-xs text-muted-foreground">CPU</span>
 							<div class="flex-1 h-2.5 rounded-full bg-muted">
@@ -617,6 +622,18 @@
 									{/if}
 									{imageUpdateLabel(c.image_update_status ?? '')}
 								</span>
+								{#if c.image_update_status === 'update_available'}
+									<p
+										class="mt-1 text-xs font-mono text-muted-foreground"
+										title="running → registry"
+									>
+										{imageVersionChange(c)}
+									</p>
+								{:else if c.image_local_version}
+									<p class="mt-1 text-xs font-mono text-muted-foreground">
+										{formatImageVersion(c.image_local_version)}
+									</p>
+								{/if}
 							</td>
 							<td class="px-4 py-3 text-center">
 								<div class="flex flex-col items-center">

@@ -9,7 +9,9 @@
 		imageUpdateLabel,
 		imageUpdateBadgeClass,
 		shortDigest,
-		formatRelativeTime
+		formatRelativeTime,
+		formatImageVersion,
+		imageVersionChange
 	} from '$lib/utils';
 	import { formatRate } from '$lib/chart-utils';
 	import { userStore } from '$lib/stores/user';
@@ -45,9 +47,14 @@
 	const portList = $derived(container?.ports ? container.ports.split(', ').filter(Boolean) : []);
 </script>
 
-{#snippet imageRow(label: string, digest: string)}
+{#snippet imageRow(label: string, version: string, digest: string)}
 	<span class="text-muted-foreground">{label}</span>
-	<span class="font-mono text-foreground" title={digest}>{shortDigest(digest)}</span>
+	<span class="flex flex-col">
+		<span class="text-foreground">{formatImageVersion(version)}</span>
+		{#if digest}
+			<span class="font-mono text-muted-foreground" title={digest}>{shortDigest(digest)}</span>
+		{/if}
+	</span>
 {/snippet}
 
 <RightSidebar {open} {onClose} size="wide">
@@ -138,11 +145,22 @@
 					{#if imageUpdate.image_update_status === 'error' && imageUpdate.image_update_error}
 						<p class="text-xs text-destructive">{imageUpdate.image_update_error}</p>
 					{/if}
-					{#if imageUpdate.image_local_digest}
+					{#if imageUpdate.image_update_status === 'update_available' && imageUpdate.image_commits_behind > 0}
+						<p class="text-xs text-warning">{imageVersionChange(imageUpdate)}</p>
+					{/if}
+					{#if imageUpdate.image_local_digest || imageUpdate.image_local_version}
 						<div class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
-							{@render imageRow('Running', imageUpdate.image_local_digest)}
+							{@render imageRow(
+								'Running',
+								imageUpdate.image_local_version,
+								imageUpdate.image_local_digest
+							)}
 							{#if imageUpdate.image_update_status === 'update_available'}
-								{@render imageRow('Registry', imageUpdate.image_remote_digest)}
+								{@render imageRow(
+									'Registry',
+									imageUpdate.image_remote_version,
+									imageUpdate.image_remote_digest
+								)}
 							{/if}
 						</div>
 					{/if}

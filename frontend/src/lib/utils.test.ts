@@ -22,6 +22,8 @@ import {
 	imageUpdateLabel,
 	imageUpdateBadgeClass,
 	shortDigest,
+	formatImageVersion,
+	imageVersionChange,
 	toggleCategory
 } from './utils';
 import type { GlobalContainer, NotificationCategory } from './types';
@@ -388,6 +390,9 @@ function makeContainer(over: Partial<GlobalContainer> = {}): GlobalContainer {
 		image_remote_digest: '',
 		image_update_error: '',
 		image_update_checked_at: null,
+		image_local_version: '',
+		image_remote_version: '',
+		image_commits_behind: 0,
 		...over
 	};
 }
@@ -458,6 +463,23 @@ describe('image update helpers', () => {
 		expect(imageUpdateBadgeClass('up_to_date')).toContain('text-success');
 		expect(imageUpdateBadgeClass('error')).toContain('text-destructive');
 		expect(imageUpdateBadgeClass('')).toContain('text-muted-foreground');
+	});
+	it('formats versions of rolling builds', () => {
+		expect(formatImageVersion('2.30.1')).toBe('2.30.1');
+		expect(formatImageVersion('2025-08-05+277')).toBe('2025-08-05 +277 commits');
+		expect(formatImageVersion('2025-08-05+1')).toBe('2025-08-05 +1 commit');
+		expect(formatImageVersion('')).toBe('unknown');
+	});
+	it('summarizes version changes', () => {
+		const v = (local: string, remote: string, behind = 0) => ({
+			image_local_version: local,
+			image_remote_version: remote,
+			image_commits_behind: behind
+		});
+		expect(imageVersionChange(v('1.29.1', '1.30.0'))).toBe('1.29.1 → 1.30.0');
+		expect(imageVersionChange(v('', '3.2.0'))).toBe('unknown → 3.2.0');
+		expect(imageVersionChange(v('2025-08-05+277', '2025-08-05+279', 2))).toBe('2 commits behind');
+		expect(imageVersionChange(v('', '', 1))).toBe('1 commit behind');
 	});
 	it('shortens digests', () => {
 		expect(shortDigest('sha256:' + 'a'.repeat(64))).toBe('sha256:aaaaaaaaaaaa');

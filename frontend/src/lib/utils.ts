@@ -357,6 +357,23 @@ export function imageUpdateBadgeClass(status: ImageUpdateStatus): string {
 	return 'bg-muted text-muted-foreground border-border';
 }
 
+// Display form of an image version: "2025-08-05+277" → "2025-08-05 +277 commits".
+export function formatImageVersion(version: string): string {
+	const m = version.match(/^(.+)\+(\d+)$/);
+	if (!m) return version || 'unknown';
+	return `${m[1]} +${m[2]} ${m[2] === '1' ? 'commit' : 'commits'}`;
+}
+
+// Summary of an available update: "1.29.1 → 1.30.0", or "2 commits behind" for
+// rolling builds, where the commit distance says more than the versions.
+export function imageVersionChange(
+	c: Pick<GlobalContainer, 'image_local_version' | 'image_remote_version' | 'image_commits_behind'>
+): string {
+	const n = c.image_commits_behind;
+	if (n > 0) return `${n} ${n === 1 ? 'commit' : 'commits'} behind`;
+	return `${c.image_local_version || 'unknown'} → ${c.image_remote_version || 'unknown'}`;
+}
+
 // Shortens "sha256:<64 hex>" to "sha256:<12 hex>" for display.
 export function shortDigest(digest: string): string {
 	if (!digest) return '-';
